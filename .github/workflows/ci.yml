@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - name: i686-unknown-linux-gnu
+            os: ubuntu-latest
+          - name: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - name: x86_64-apple-darwin
+            os: macos-latest
+          - name: aarch64-apple-darwin
+            os: macos-latest
+          - name: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+          - name: x86_64-unknown-freebsd
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.target.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        if: runner.os != 'macOS'
+        run: cargo install cross
+
+      - name: Add Required Rust Target
+        run: rustup target add ${{ matrix.target.name }}
+
+      - name: Build
+        run: |
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            cargo build --release --target ${{ matrix.target.name }}
+          else
+            cross build --release --target ${{ matrix.target.name }}
+          fi
+
+      - name: Prepare Release Asset
+        run: |
+          mkdir -p release
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            find target/${{ matrix.target.name }}/release -maxdepth 1 -type f | while read file; do
+              if file "$file" | grep -q 'Mach-O'; then
+                cp "$file" release/
+              fi
+            done
+          else
+            find target/${{ matrix.target.name }}/release -maxdepth 1 -type f -executable -exec cp {} release/ \;
+          fi
+          tar -czf ${{ matrix.target.name }}-binary.tar.gz -C release .
+        shell: bash
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.name }}-binary
+          path: ${{ matrix.target.name }}-binary.tar.gz
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./artifacts/**/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}

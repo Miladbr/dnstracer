@@ -1,0 +1,9 @@
+[package]
+name = "dnstracer"
+authors = ["Milad Baharirad <bahari.rad@gmail.com>"]
+version = "0.1.0"
+edition = "2021"
+description = "A tool to measure and analyze DNS query response times for network performance and latency."
+repository = "https://github.com/miladbr/dnstracer"
+
+[dependencies]

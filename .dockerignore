@@ -1,0 +1,21 @@
+# Ignore target directory
+target/
+
+# Ignore any compiled binaries
+**/target/
+
+# Ignore Cargo.lock file
+Cargo.lock
+
+# Ignore build artifacts
+**/*.rs.bk
+
+# Ignore any files generated during testing
+**/debug/
+**/release/
+**/.idea/
+
+# Exclude any version control directories
+.git/
+.vscode/
+tests/
