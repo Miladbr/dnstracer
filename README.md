@@ -31,7 +31,7 @@
   ```
 
   ```
-  $ dnstracer compare github.blog tests/dns.txt 15 5
+  $ dnstracer compare github.blog 15 5
 
   server                    min(ms)    avg(ms)    max(ms)    stddev(ms)   lost(%)
   -----------------------------------------------------------------------------
@@ -80,14 +80,14 @@
   - ***Compare multiple DNS servers***
 
     ```
-    dnstracer compare <domain> <dns_file> <interval> <count>
+    dnstracer compare <domain> [dns_file] <interval> <count>
         - domain:     The domain name to query.
-        - dns_file:   Path to a file containing a list of DNS servers.
+        - dns_file[Optional]:   Path to a file containing a list of DNS servers. If not provided dnstracer uses embeded DNS list.
         - interval:   Time in seconds between each query.
         - count:      Number of queries to perform.
 
     Example:
-    dnstracer compare raw.githubusercontent.com tests/dns.txt 5 10
+    dnstracer compare raw.githubusercontent.com 5 10
     ```
 ## Installation
 - ***Download pre-built binaries:***
