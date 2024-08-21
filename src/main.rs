@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, Cursor, BufReader, BufRead};
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 use std::thread::sleep;
@@ -8,6 +8,32 @@ use std::f64;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_SIZE: usize = 512;
+const DEFAULT_DNS_SERVERS: [&str; 24] = [
+    "9.9.9.11:53",       // Quad9
+    "149.112.112.11:53", // Quad9
+    "9.9.9.10:53",       // Quad9
+    "149.112.112.10:53", // Quad9
+    "1.1.1.1:53",        // Cloudflare
+    "1.0.0.1:53",        // Cloudflare
+    "8.8.8.8:53",        // Google
+    "8.8.4.4:53",        // Google
+    "9.9.9.9:53",        // Quad9
+    "149.112.112.112:53",// Quad9
+    "208.67.222.222:53", // OpenDNS
+    "208.67.220.220:53", // OpenDNS
+    "64.6.64.6:53",      // Verisign
+    "64.6.65.6:53",      // Verisign
+    "8.26.56.26:53",     // Comodo Secure DNS
+    "8.20.247.20:53",    // Comodo Secure DNS
+    "77.88.8.8:53",      // Yandex DNS
+    "77.88.8.1:53",      // Yandex DNS
+    "185.228.168.168:53",// CleanBrowsing
+    "185.228.169.168:53",// CleanBrowsing
+    "156.154.70.1:53",   // Neustar UltraDNS
+    "156.154.71.1:53",   // Neustar UltraDNS
+    "199.85.126.10:53",  // Norton ConnectSafe
+    "199.85.127.10:53",  // Norton ConnectSafe
+];
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -30,14 +56,23 @@ fn main() -> io::Result<()> {
             ping(domain, dns_server, interval, count, show_plot)?;
         }
         "compare" => {
-            if args.len() != 6 {
+            if args.len() < 5 || args.len() > 6 {
                 print_usage_and_exit();
             }
             let domain = &args[2];
-            let dns_file = &args[3];
-            let interval = args[4].parse::<u64>().expect("Interval must be a number");
-            let count = args[5].parse::<u32>().expect("Count must be a number");
-
+            let (dns_file, interval, count) = if args.len() == 6 {
+                (
+                    &args[3] as &str,
+                    args[4].parse::<u64>().expect("Interval must be a number"),
+                    args[5].parse::<u32>().expect("Count must be a number"),
+                )
+            } else {
+                (
+                    "",
+                    args[3].parse::<u64>().expect("Interval must be a number"),
+                    args[4].parse::<u32>().expect("Count must be a number"),
+                )
+            };
             compare(domain, dns_file, interval, count)?;
         }
         _ => {
@@ -100,8 +135,13 @@ fn ping(domain: &str, dns_server: &str, interval: u64, count: u32, show_plot: bo
 }
 
 fn compare(domain: &str, dns_file: &str, interval: u64, count: u32) -> io::Result<()> {
-    let file = File::open(dns_file)?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead> = if dns_file.is_empty() {
+        // Use the default DNS servers as an in-memory buffer
+        Box::new(BufReader::new(Cursor::new(DEFAULT_DNS_SERVERS.join("\n"))))
+    } else {
+        // Open and read from the specified file
+        Box::new(BufReader::new(File::open(dns_file)?))
+    };
 
     println!("{:<25} {:<10} {:<10} {:<10} {:<12} {:<10}", 
         "server", "min(ms)", "avg(ms)", "max(ms)", "stddev(ms)", "lost(%)");
