@@ -119,7 +119,7 @@ fn print_usage_and_exit() {
   | |_| | | | \__ \   | || | | (_| | (_|  __/ |   
   |____/|_| |_|___/   |_||_|  \__,_|\___\___|_|                                                  
 
-   DNS Tracer Tool v0.2
+   DNS Tracer Tool v0.1.2
    A tool to measure and analyze DNS query response times for network performance and latency.
 
    Developed by: @milad_bahari
