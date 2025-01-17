@@ -22,9 +22,11 @@ jobs:
             os: ubuntu-latest
           - name: x86_64-unknown-freebsd
             os: ubuntu-latest
+          - name: aarch64-linux-android
+            os: ubuntu-latest
           - name: armv7-linux-androideabi
             os: ubuntu-latest
-          - name: aarch64-linux-android
+          - name: i686-linux-android
             os: ubuntu-latest
 
     runs-on: ${{ matrix.target.os }}
@@ -39,17 +41,6 @@ jobs:
       - name: Install cross
         if: runner.os != 'macOS'
         run: cargo install cross
-
-      - name: Install Android NDK
-        if: contains(matrix.target.name, 'android')
-        run: |
-          sudo mkdir -p /usr/lib/android-sdk
-          curl -o commandlinetools-linux.zip https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
-          sudo unzip -d /usr/lib/android-sdk commandlinetools-linux.zip
-          rm commandlinetools-linux.zip
-          yes | /usr/lib/android-sdk/cmdline-tools/bin/sdkmanager --install "ndk-bundle"
-          echo "export ANDROID_HOME=/usr/lib/android-sdk" >> $GITHUB_ENV
-          echo "export PATH=$PATH:/usr/lib/android-sdk/platform-tools:/usr/lib/android-sdk/ndk-bundle" >> $GITHUB_ENV
 
       - name: Add Required Rust Target
         run: rustup target add ${{ matrix.target.name }}
