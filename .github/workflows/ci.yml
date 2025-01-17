@@ -22,6 +22,10 @@ jobs:
             os: ubuntu-latest
           - name: x86_64-unknown-freebsd
             os: ubuntu-latest
+          - name: armv7-linux-androideabi
+            os: ubuntu-latest
+          - name: aarch64-linux-android
+            os: ubuntu-latest
 
     runs-on: ${{ matrix.target.os }}
 
@@ -35,6 +39,10 @@ jobs:
       - name: Install cross
         if: runner.os != 'macOS'
         run: cargo install cross
+
+      - name: Install Android NDK
+        if: contains(matrix.target.name, 'android')
+        run: sudo apt-get install android-ndk
 
       - name: Add Required Rust Target
         run: rustup target add ${{ matrix.target.name }}
