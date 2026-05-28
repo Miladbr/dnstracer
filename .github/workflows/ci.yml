@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - ci-test
+    tags:
+      - 'v*.*.*'
 
 jobs:
   build:
