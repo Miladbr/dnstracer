@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches:
+      - ci-test
 
 jobs:
   build:
@@ -12,22 +12,34 @@ jobs:
         target:
           - name: i686-unknown-linux-gnu
             os: ubuntu-latest
+            build: cross
           - name: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            build: native
           - name: x86_64-apple-darwin
             os: macos-latest
+            build: native
           - name: aarch64-apple-darwin
             os: macos-latest
-          - name: x86_64-pc-windows-gnu
-            os: ubuntu-latest
+            build: native
+          - name: x86_64-pc-windows-msvc
+            os: windows-latest
+            build: native
           - name: x86_64-unknown-freebsd
             os: ubuntu-latest
+            build: cross
           - name: aarch64-linux-android
             os: ubuntu-latest
+            build: ndk
+            ndk_linker: aarch64-linux-android21-clang
           - name: armv7-linux-androideabi
             os: ubuntu-latest
+            build: ndk
+            ndk_linker: armv7a-linux-androideabi21-clang
           - name: i686-linux-android
             os: ubuntu-latest
+            build: ndk
+            ndk_linker: i686-linux-android21-clang
 
     runs-on: ${{ matrix.target.os }}
 
@@ -39,24 +51,32 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cross
-        if: runner.os != 'macOS'
-        run: cargo install cross
+        if: matrix.target.build == 'cross'
+        run: cargo install cross --locked
 
       - name: Add Required Rust Target
         run: rustup target add ${{ matrix.target.name }}
 
       - name: Build
+        shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            cargo build --release --target ${{ matrix.target.name }}
-          else
+          if [[ "${{ matrix.target.build }}" == "cross" ]]; then
             cross build --release --target ${{ matrix.target.name }}
+          elif [[ "${{ matrix.target.build }}" == "ndk" ]]; then
+            TOOLCHAIN=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+            cargo build --release --target ${{ matrix.target.name }} \
+              --config "target.${{ matrix.target.name }}.linker='$TOOLCHAIN/${{ matrix.target.ndk_linker }}'"
+          else
+            cargo build --release --target ${{ matrix.target.name }}
           fi
 
       - name: Prepare Release Asset
+        shell: bash
         run: |
           mkdir -p release
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
+          if [[ "${{ matrix.target.name }}" == *"windows"* ]]; then
+            cp target/${{ matrix.target.name }}/release/dnstracer.exe release/
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
             find target/${{ matrix.target.name }}/release -maxdepth 1 -type f | while read file; do
               if file "$file" | grep -q 'Mach-O'; then
                 cp "$file" release/
@@ -66,7 +86,6 @@ jobs:
             find target/${{ matrix.target.name }}/release -maxdepth 1 -type f -executable -exec cp {} release/ \;
           fi
           tar -czf ${{ matrix.target.name }}-binary.tar.gz -C release .
-        shell: bash
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
