@@ -1,13 +1,15 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, Cursor, BufReader, BufRead};
+use std::io::{self, Cursor, BufReader, BufRead, IsTerminal};
 use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::thread::sleep;
 use std::f64;
 
-const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_SIZE: usize = 512;
+const CONCURRENCY_LIMIT: usize = 16;
 const DEFAULT_DNS_SERVERS: [&str; 42] = [
     // Alibaba
     "223.5.5.5:53",
@@ -62,45 +64,193 @@ const DEFAULT_DNS_SERVERS: [&str; 42] = [
     "77.88.8.3:53"
 ];
 
+#[derive(Copy, Clone)]
+enum QueryType {
+    A,
+    Aaaa,
+    Txt,
+    Ns,
+}
+
+impl QueryType {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "A"    => Some(Self::A),
+            "AAAA" => Some(Self::Aaaa),
+            "TXT"  => Some(Self::Txt),
+            "NS"   => Some(Self::Ns),
+            _      => None,
+        }
+    }
+
+    fn type_code(self) -> [u8; 2] {
+        match self {
+            Self::A    => [0x00, 0x01],
+            Self::Aaaa => [0x00, 0x1C],
+            Self::Txt  => [0x00, 0x10],
+            Self::Ns   => [0x00, 0x02],
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum SortBy { Min, Avg, Max, StdDev, Loss }
+
+impl SortBy {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "min"    => Some(Self::Min),
+            "avg"    => Some(Self::Avg),
+            "max"    => Some(Self::Max),
+            "stddev" => Some(Self::StdDev),
+            "loss"   => Some(Self::Loss),
+            _        => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum OutputFormat { Text, Json }
+
+impl OutputFormat {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _      => None,
+        }
+    }
+}
+
+struct ResultRow {
+    server:   String,
+    min:      f64,
+    avg:      f64,
+    max:      f64,
+    stddev:   f64,
+    loss:     f64,
+    is_error: bool,
+}
+
+impl ResultRow {
+    fn sort_key(&self, by: SortBy) -> f64 {
+        if self.is_error || self.loss >= 100.0 {
+            return f64::MAX;
+        }
+        match by {
+            SortBy::Min    => self.min,
+            SortBy::Avg    => self.avg,
+            SortBy::Max    => self.max,
+            SortBy::StdDev => self.stddev,
+            SortBy::Loss   => self.loss,
+        }
+    }
+
+    fn to_text(&self) -> String {
+        let name = display_server(&self.server);
+        if self.is_error {
+            format!("{:<25} error", name)
+        } else if self.loss >= 100.0 {
+            format!("{:<25} {:<10} {:<10} {:<10} {:<12} {:<10.1}", name, "---", "---", "---", "---", self.loss)
+        } else {
+            format!("{:<25} {:<10.3} {:<10.3} {:<10.3} {:<12.3} {:<10.1}",
+                name, self.min, self.avg, self.max, self.stddev, self.loss)
+        }
+    }
+
+    fn to_json(&self) -> String {
+        let name = display_server(&self.server);
+        if self.is_error {
+            format!(r#"{{"server":"{}","error":true}}"#, name)
+        } else {
+            format!(
+                r#"{{"server":"{}","min":{:.3},"avg":{:.3},"max":{:.3},"stddev":{:.3},"loss":{:.1}}}"#,
+                name, self.min, self.avg, self.max, self.stddev, self.loss
+            )
+        }
+    }
+}
+
+fn flag_val<'a>(args: &'a [String], long: &str, short: &str) -> Option<&'a str> {
+    let long_key = format!("--{}", long);
+    let short_key = format!("-{}", short);
+    args.windows(2)
+        .find(|w| w[0] == long_key || w[0] == short_key)
+        .map(|w| w[1].as_str())
+}
+
+fn flag_exists(args: &[String], long: &str, short: &str) -> bool {
+    let long_key = format!("--{}", long);
+    let short_key = format!("-{}", short);
+    args.iter().any(|a| a == &long_key || a == &short_key)
+}
+
+fn require_flag(args: &[String], long: &str, short: &str) -> String {
+    flag_val(args, long, short).unwrap_or_else(|| {
+        eprintln!("--{} is required", long);
+        std::process::exit(1);
+    }).to_string()
+}
+
+fn parse_qtype(s: &str) -> QueryType {
+    QueryType::from_str(s).unwrap_or_else(|| {
+        eprintln!("Unknown query type '{}'. Supported: A, AAAA, TXT, NS", s);
+        std::process::exit(1);
+    })
+}
+
+fn parse_sort_by(s: &str) -> SortBy {
+    SortBy::from_str(s).unwrap_or_else(|| {
+        eprintln!("Unknown sort field '{}'. Supported: min, avg, max, stddev, loss", s);
+        std::process::exit(1);
+    })
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_usage_and_exit();
     }
 
-    let subcommand = &args[1];
-    match subcommand.as_str() {
-        "ping" => {
-            if args.len() != 7 {
-                print_usage_and_exit();
-            }
-            let domain = &args[2];
-            let dns_server = &args[3];
-            let interval = args[4].parse::<u64>().expect("Interval must be a number");
-            let count = args[5].parse::<u32>().expect("Count must be a number");
-            let show_plot = args[6].parse::<bool>().expect("Show plot must be a boolean (true or false)");
+    if args[1] == "--version" || args[1] == "-V" {
+        println!("dnstracer {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
-            ping(domain, dns_server, interval, count, show_plot)?;
+    let subcommand = args[1].as_str();
+    let flags = &args[2..];
+
+    match subcommand {
+        "ping" => {
+            let domain = require_flag(flags, "domain", "d");
+            let server = normalize_server(&require_flag(flags, "server", "s"));
+            let interval = flag_val(flags, "interval", "i").unwrap_or("1")
+                .parse::<u64>().unwrap_or_else(|_| { eprintln!("--interval must be a number"); std::process::exit(1); });
+            let count = flag_val(flags, "count", "c").unwrap_or("5")
+                .parse::<u32>().unwrap_or_else(|_| { eprintln!("--count must be a number"); std::process::exit(1); });
+            let timeout = Duration::from_secs(flag_val(flags, "timeout", "T").unwrap_or("5")
+                .parse::<u64>().unwrap_or_else(|_| { eprintln!("--timeout must be a number"); std::process::exit(1); }));
+            let show_plot = flag_exists(flags, "plot", "p");
+            let qtype = parse_qtype(flag_val(flags, "type", "t").unwrap_or("A"));
+            ping(&domain, &server, interval, count, show_plot, qtype, timeout)?;
         }
         "compare" => {
-            if args.len() < 5 || args.len() > 6 {
-                print_usage_and_exit();
-            }
-            let domain = &args[2];
-            let (dns_file, interval, count) = if args.len() == 6 {
-                (
-                    &args[3] as &str,
-                    args[4].parse::<u64>().expect("Interval must be a number"),
-                    args[5].parse::<u32>().expect("Count must be a number"),
-                )
-            } else {
-                (
-                    "",
-                    args[3].parse::<u64>().expect("Interval must be a number"),
-                    args[4].parse::<u32>().expect("Count must be a number"),
-                )
-            };
-            compare(domain, dns_file, interval, count)?;
+            let domain = require_flag(flags, "domain", "d");
+            let dns_file = flag_val(flags, "file", "f").unwrap_or("").to_string();
+            let interval = flag_val(flags, "interval", "i").unwrap_or("1")
+                .parse::<u64>().unwrap_or_else(|_| { eprintln!("--interval must be a number"); std::process::exit(1); });
+            let count = flag_val(flags, "count", "c").unwrap_or("5")
+                .parse::<u32>().unwrap_or_else(|_| { eprintln!("--count must be a number"); std::process::exit(1); });
+            let timeout = Duration::from_secs(flag_val(flags, "timeout", "T").unwrap_or("5")
+                .parse::<u64>().unwrap_or_else(|_| { eprintln!("--timeout must be a number"); std::process::exit(1); }));
+            let qtype = parse_qtype(flag_val(flags, "type", "t").unwrap_or("A"));
+            let sort_by = parse_sort_by(flag_val(flags, "sort", "S").unwrap_or("avg"));
+            let out_fmt = OutputFormat::from_str(flag_val(flags, "output", "o").unwrap_or("text"))
+                .unwrap_or_else(|| { eprintln!("--output must be text or json"); std::process::exit(1); });
+            let watch_secs = flag_val(flags, "watch", "w").map(|s| s.parse::<u64>()
+                .unwrap_or_else(|_| { eprintln!("--watch must be a number"); std::process::exit(1); }))
+                .unwrap_or(0);
+            compare(&domain, &dns_file, interval, count, qtype, sort_by, timeout, out_fmt, watch_secs)?;
         }
         _ => {
             print_usage_and_exit();
@@ -119,37 +269,49 @@ fn print_usage_and_exit() {
   | |_| | | | \__ \   | || | | (_| | (_|  __/ |   
   |____/|_| |_|___/   |_||_|  \__,_|\___\___|_|                                                  
 
-   DNS Tracer Tool v0.1.2
+   DNS Tracer Tool v{}
+
    A tool to measure and analyze DNS query response times for network performance and latency.
 
    Developed by: @milad_bahari
  
    USAGE:
-     ./dnstracer ping <domain> <dns_server> <interval> <count> <show_plot>
-       - domain:     The domain name to query.
-       - dns_server: The DNS server to use (e.g., 1.1.1.1:53).
-       - interval:   Time in seconds between each query.
-       - count:      Number of queries to perform.
-       - show_plot:  Set to 'true' to display a plot of the response times.
- 
-     ./dnstracer compare <domain> <dns_file> <interval> <count>
-       - domain:     The domain name to query.
-       - dns_file:   Path to a file containing a list of DNS servers.
-       - interval:   Time in seconds between each query.
-       - count:      Number of queries to perform.
-   
+     dnstracer ping -d <domain> -s <server> [-i <seconds>] [-c <n>] [-T <seconds>] [-p] [-t A|AAAA|TXT|NS]
+       - -d, --domain:    The domain name to query.
+       - -s, --server:    DNS server — IPv4 (1.1.1.1), IPv6 (2606:4700::1111), or with port (1.1.1.1:5353).
+       - -i, --interval:  Time in seconds between each query (default: 1).
+       - -c, --count:     Number of queries to perform (default: 5).
+       - -T, --timeout:   Query timeout in seconds (default: 5).
+       - -p, --plot:      Display a plot of response times.
+       - -t, --type:      Query type (default: A). Supported: A, AAAA, TXT, NS.
+
+     dnstracer compare -d <domain> [-f <dns_file>] [-i <seconds>] [-c <n>] [-T <seconds>] [-t A|AAAA|TXT|NS] [-S min|avg|max|stddev|loss] [-o text|json] [-w <seconds>]
+       - -d, --domain:    The domain name to query.
+       - -f, --file:      Path to a file containing DNS servers (uses built-in list if omitted).
+       - -i, --interval:  Time in seconds between each query (default: 1).
+       - -c, --count:     Number of queries to perform (default: 5).
+       - -T, --timeout:   Query timeout in seconds (default: 5).
+       - -t, --type:      Query type (default: A). Supported: A, AAAA, TXT, NS.
+       - -S, --sort:      Sort results by field (default: avg). Supported: min, avg, max, stddev, loss.
+       - -o, --output:    Output format (default: text). Supported: text, json.
+       - -w, --watch:     Re-run every N seconds and refresh the screen.
+
    EXAMPLES:
-     ./dnstracer ping google.com 1.1.1.1:53 5 10 true
-     ./dnstracer compare google.com tests/dns.txt 5 10
+     dnstracer --version
+     dnstracer ping -d google.com -s 1.1.1.1 -i 5 -c 10 -p
+     dnstracer ping -d google.com -s 2606:4700:4700::1111 -c 10 -t AAAA
+     dnstracer compare -d google.com -i 5 -c 10
+     dnstracer compare -d google.com -f tests/dns.txt -c 10 -o json
+     dnstracer compare -d google.com -c 5 -w 30
  
    Happy debugging!
- "#
+ "#, env!("CARGO_PKG_VERSION")
      );
     std::process::exit(1);
 }
 
-fn ping(domain: &str, dns_server: &str, interval: u64, count: u32, show_plot: bool) -> io::Result<()> {
-    let (response_times, failed) = perform_dns_queries(domain, dns_server, count, interval, true)?;
+fn ping(domain: &str, dns_server: &str, interval: u64, count: u32, show_plot: bool, qtype: QueryType, timeout: Duration) -> io::Result<()> {
+    let (response_times, failed) = perform_dns_queries(domain, dns_server, count, interval, true, qtype, timeout)?;
     let stats = calculate_statistics(&response_times);
 
     print_statistics(domain, count, failed, &stats);
@@ -161,35 +323,168 @@ fn ping(domain: &str, dns_server: &str, interval: u64, count: u32, show_plot: bo
     Ok(())
 }
 
-fn compare(domain: &str, dns_file: &str, interval: u64, count: u32) -> io::Result<()> {
+fn display_server(s: &str) -> String {
+    let s = s.strip_suffix(":53").unwrap_or(s);
+    if s.starts_with('[') && s.ends_with(']') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+fn normalize_server(s: &str) -> String {
+    if s.starts_with('[') {
+        s.to_string() // already [IPv6]:port
+    } else if s.chars().filter(|&c| c == ':').count() > 1 {
+        format!("[{}]:53", s) // bare IPv6, add brackets + port
+    } else if s.contains(':') {
+        s.to_string() // IPv4 with port
+    } else {
+        format!("{}:53", s) // IPv4 without port
+    }
+}
+
+fn spectrum_color(t: f64) -> (u8, u8, u8) {
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let (r, g, b) = if t < 0.5 {
+        let t2 = t * 2.0;
+        (lerp(0.0, 220.0, t2), lerp(200.0, 180.0, t2), 0.0)
+    } else {
+        let t2 = (t - 0.5) * 2.0;
+        (220.0, lerp(180.0, 0.0, t2), 0.0)
+    };
+    (r as u8, g as u8, b as u8)
+}
+
+fn compare(domain: &str, dns_file: &str, interval: u64, count: u32, qtype: QueryType, sort_by: SortBy, timeout: Duration, out_fmt: OutputFormat, watch_secs: u64) -> io::Result<()> {
     let reader: Box<dyn BufRead> = if dns_file.is_empty() {
-        // Use the default DNS servers as an in-memory buffer
         Box::new(BufReader::new(Cursor::new(DEFAULT_DNS_SERVERS.join("\n"))))
     } else {
-        // Open and read from the specified file
         Box::new(BufReader::new(File::open(dns_file)?))
     };
 
-    println!("{:<25} {:<10} {:<10} {:<10} {:<12} {:<10}", 
-        "server", "min(ms)", "avg(ms)", "max(ms)", "stddev(ms)", "lost(%)");
-    println!("{:-<77}", "");
+    let servers: Vec<String> = reader.lines()
+        .collect::<io::Result<Vec<String>>>()?
+        .into_iter()
+        .map(|s| normalize_server(&s))
+        .collect();
 
-    for line in reader.lines() {
-        let dns_server = line?;
-        let (response_times, failed) = perform_dns_queries(domain, &dns_server, count, interval, false)?;
-        let stats = calculate_statistics(&response_times);
+    let is_tty = io::stdout().is_terminal();
+    let watch_mode = watch_secs > 0;
 
-        let result = generate_compare_output(&dns_server, count, failed, &stats)?;
-        println!("{}", result);
+    loop {
+        let streaming = matches!(out_fmt, OutputFormat::Text) && is_tty && !watch_mode;
+
+        if streaming {
+            print!("\x1b[?1049h");
+            println!("{:<25} {:<10} {:<10} {:<10} {:<12} {:<10}",
+                "server", "min(ms)", "avg(ms)", "max(ms)", "stddev(ms)", "lost(%)");
+            println!("{:-<77}", "");
+        }
+
+        let (work_tx, work_rx) = mpsc::channel::<String>();
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (result_tx, result_rx) = mpsc::channel::<ResultRow>();
+
+        let num_workers = CONCURRENCY_LIMIT.min(servers.len());
+        let mut handles = Vec::with_capacity(num_workers);
+
+        for _ in 0..num_workers {
+            let work_rx = Arc::clone(&work_rx);
+            let result_tx = result_tx.clone();
+            let domain = domain.to_string();
+
+            handles.push(thread::spawn(move || {
+                loop {
+                    let server = match work_rx.lock().unwrap().recv() {
+                        Ok(item) => item,
+                        Err(_) => break,
+                    };
+                    let row = match perform_dns_queries(&domain, &server, count, interval, false, qtype, timeout) {
+                        Ok((times, failed)) => {
+                            let stats = calculate_statistics(&times);
+                            let loss_pct = (failed as f64 / count as f64) * 100.0;
+                            ResultRow { server, min: stats.0, avg: stats.1, max: stats.2, stddev: stats.3, loss: loss_pct, is_error: false }
+                        }
+                        Err(_) => ResultRow { server, min: 0.0, avg: 0.0, max: 0.0, stddev: 0.0, loss: 100.0, is_error: true },
+                    };
+                    if result_tx.send(row).is_err() { break; }
+                }
+            }));
+        }
+
+        drop(result_tx);
+
+        for server in &servers {
+            work_tx.send(server.clone()).unwrap();
+        }
+        drop(work_tx);
+
+        let mut all_results: Vec<ResultRow> = Vec::with_capacity(servers.len());
+        for row in result_rx {
+            if streaming { println!("{}", row.to_text()); }
+            all_results.push(row);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        all_results.sort_by(|a, b| {
+            a.sort_key(sort_by).partial_cmp(&b.sort_key(sort_by))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        match out_fmt {
+            OutputFormat::Text => {
+                if streaming {
+                    print!("\x1b[?1049l");
+                } else if watch_mode && is_tty {
+                    print!("\x1b[2J\x1b[H");
+                } else if !is_tty && !watch_mode {
+                    println!();
+                }
+
+                println!("{:<25} {:<10} {:<10} {:<10} {:<12} {:<10}",
+                    "server", "min(ms)", "avg(ms)", "max(ms)", "stddev(ms)", "lost(%)");
+                println!("{:-<77}", "");
+                let n = all_results.len();
+                for (i, row) in all_results.iter().enumerate() {
+                    if is_tty && n > 1 && !row.is_error {
+                        let t = i as f64 / (n - 1) as f64;
+                        let (r, g, b) = spectrum_color(t);
+                        println!("\x1b[38;2;{};{};{}m{}\x1b[0m", r, g, b, row.to_text());
+                    } else {
+                        println!("{}", row.to_text());
+                    }
+                }
+
+                if watch_mode {
+                    println!("\nRefreshing every {}s — Ctrl+C to quit", watch_secs);
+                    thread::sleep(Duration::from_secs(watch_secs));
+                }
+            }
+            OutputFormat::Json => {
+                if streaming { print!("\x1b[?1049l"); }
+                let items: Vec<String> = all_results.iter().map(|r| r.to_json()).collect();
+                println!("[{}]", items.join(","));
+                if watch_mode {
+                    thread::sleep(Duration::from_secs(watch_secs));
+                }
+            }
+        }
+
+        if !watch_mode { break; }
     }
 
     Ok(())
 }
 
-fn perform_dns_queries(domain: &str, dns_server: &str, count: u32, interval: u64, verbose: bool) -> io::Result<(Vec<f64>, u32)> {
-    let packet = create_dns_query(domain);
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(TIMEOUT))?;
+fn perform_dns_queries(domain: &str, dns_server: &str, count: u32, interval: u64, verbose: bool, qtype: QueryType, timeout: Duration) -> io::Result<(Vec<f64>, u32)> {
+    let packet = create_dns_query(domain, qtype);
+    let bind_addr = if dns_server.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.set_read_timeout(Some(timeout))?;
 
     let mut response_times = Vec::new();
     let mut failed = 0;
@@ -219,7 +514,7 @@ fn perform_dns_queries(domain: &str, dns_server: &str, count: u32, interval: u64
                             println!(
                                 "{} bytes from {} seq={} time={:.3}ms - {} -> {}",
                                 resp_size,
-                                dns_server,
+                                display_server(dns_server),
                                 c,
                                 duration_ms,
                                 domain,
@@ -239,13 +534,13 @@ fn perform_dns_queries(domain: &str, dns_server: &str, count: u32, interval: u64
             }
         }
 
-        sleep(Duration::from_secs(interval));
+        thread::sleep(Duration::from_secs(interval));
     }
 
     Ok((response_times, failed))
 }
 
-fn create_dns_query(domain: &str) -> Vec<u8> {
+fn create_dns_query(domain: &str, qtype: QueryType) -> Vec<u8> {
     let mut packet = vec![
         0x12, 0x12,
         0x01, 0x00,
@@ -260,53 +555,117 @@ fn create_dns_query(domain: &str) -> Vec<u8> {
         packet.extend_from_slice(part.as_bytes());
     }
     packet.push(0x00);
-    packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+    packet.extend_from_slice(&qtype.type_code()); // QTYPE
+    packet.extend_from_slice(&[0x00, 0x01]);       // QCLASS IN
 
     packet
 }
 
 
 fn parse_dns_response(response: &[u8]) -> io::Result<String> {
-    let mut offset = 12;
-    while response[offset] != 0 {
-        offset += response[offset] as usize + 1;
+    if response.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "response too short"));
     }
+
+    // Skip the question section name (starts at byte 12)
+    let mut offset = 12;
+    loop {
+        if offset >= response.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in question section"));
+        }
+        let label_len = response[offset] as usize;
+        if label_len == 0 {
+            break;
+        }
+        offset += label_len + 1;
+    }
+    // Skip null byte + QTYPE (2) + QCLASS (2)
     offset += 5;
 
-    let mut result = String::new();
     let ancount = (response[6] as usize) << 8 | (response[7] as usize);
+    let mut result = String::new();
 
     for _ in 0..ancount {
+        // Skip the answer's name field
+        if offset >= response.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in answer name"));
+        }
         if response[offset] & 0xC0 == 0xC0 {
-            offset += 2; // Skip the name pointer
+            offset += 2;
         } else {
-            while response[offset] != 0 {
-                offset += response[offset] as usize + 1;
+            loop {
+                if offset >= response.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in answer name"));
+                }
+                let label_len = response[offset] as usize;
+                if label_len == 0 {
+                    offset += 1;
+                    break;
+                }
+                offset += label_len + 1;
             }
-            offset += 1; // Skip the null byte
         }
 
+        // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes
+        if offset + 10 > response.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in answer record"));
+        }
         let answer_type = &response[offset..offset + 2];
         let answer_class = &response[offset + 2..offset + 4];
         let answer_data_len = (response[offset + 8] as usize) << 8 | (response[offset + 9] as usize);
-        let answer_data = &response[offset + 10..offset + 10 + answer_data_len];
-        offset += 10 + answer_data_len;
+
+        if offset + 10 + answer_data_len > response.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in answer data"));
+        }
+        let rdata_start = offset + 10;
+        let answer_data = &response[rdata_start..rdata_start + answer_data_len];
+        offset = rdata_start + answer_data_len;
 
         if answer_type == [0x00, 0x01] && answer_class == [0x00, 0x01] {
+            // A record: 4-byte IPv4 address
             if answer_data_len == 4 {
-                let ip_addr = format!("{}.{}.{}.{}", answer_data[0], answer_data[1], answer_data[2], answer_data[3]);
-                result.push_str(&format!("{} ", ip_addr));
+                result.push_str(&format!("{}.{}.{}.{} ", answer_data[0], answer_data[1], answer_data[2], answer_data[3]));
             }
+        } else if answer_type == [0x00, 0x1C] && answer_class == [0x00, 0x01] {
+            // AAAA record: 16-byte IPv6 address
+            if answer_data_len == 16 {
+                let addr = (0..8)
+                    .map(|i| format!("{:04x}", (answer_data[i * 2] as u16) << 8 | answer_data[i * 2 + 1] as u16))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                result.push_str(&format!("{} ", addr));
+            }
+        } else if answer_type == [0x00, 0x10] && answer_class == [0x00, 0x01] {
+            // TXT record: one or more length-prefixed strings
+            let mut off = 0;
+            while off < answer_data_len {
+                let slen = answer_data[off] as usize;
+                off += 1;
+                if off + slen <= answer_data_len {
+                    if let Ok(s) = std::str::from_utf8(&answer_data[off..off + slen]) {
+                        result.push_str(s);
+                    }
+                }
+                off += slen;
+            }
+            result.push(' ');
+        } else if answer_type == [0x00, 0x02] && answer_class == [0x00, 0x01] {
+            // NS record: domain name in wire format
+            let mut ns_name = String::new();
+            parse_name(response, rdata_start, &mut ns_name)?;
+            result.push_str(&format!("{} ", ns_name));
         } else if answer_type == [0x00, 0x05] && answer_class == [0x00, 0x01] {
             let mut cname = String::new();
             let mut cname_offset = 0;
             while cname_offset < answer_data_len {
                 let label_len = answer_data[cname_offset] as usize;
                 if label_len & 0xC0 == 0xC0 {
-                    // It is a pointer
+                    if cname_offset + 2 > answer_data_len {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "CNAME pointer out of bounds"));
+                    }
                     let pointer = ((label_len & 0x3F) << 8) | (answer_data[cname_offset + 1] as usize);
-                    cname_offset += 2;
-                    parse_name(&response, pointer, &mut cname)?;
+                    parse_name(response, pointer, &mut cname)?;
+                    break; // pointer terminates the name
                 } else {
                     if label_len == 0 {
                         break;
@@ -317,7 +676,8 @@ fn parse_dns_response(response: &[u8]) -> io::Result<String> {
                     if cname_offset + 1 + label_len > answer_data_len {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "CNAME label length exceeds data length"));
                     }
-                    cname.push_str(std::str::from_utf8(&answer_data[cname_offset + 1..cname_offset + 1 + label_len]).unwrap());
+                    cname.push_str(std::str::from_utf8(&answer_data[cname_offset + 1..cname_offset + 1 + label_len])
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in CNAME"))?);
                     cname_offset += label_len + 1;
                 }
             }
@@ -326,7 +686,7 @@ fn parse_dns_response(response: &[u8]) -> io::Result<String> {
     }
 
     if result.is_empty() {
-        Err(io::Error::new(io::ErrorKind::InvalidData, "No A or CNAME records found"))
+        Err(io::Error::new(io::ErrorKind::InvalidData, "No matching records found in response"))
     } else {
         Ok(result)
     }
@@ -334,12 +694,22 @@ fn parse_dns_response(response: &[u8]) -> io::Result<String> {
 
 
 fn parse_name(response: &[u8], mut offset: usize, name: &mut String) -> io::Result<()> {
+    let mut hops = 0;
     loop {
+        if hops > 10 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "DNS name compression pointer loop"));
+        }
+        if offset >= response.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in name"));
+        }
         let label_len = response[offset] as usize;
         if label_len & 0xC0 == 0xC0 {
-            // It is a pointer
+            if offset + 2 > response.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "response truncated in name pointer"));
+            }
             let pointer = ((label_len & 0x3F) << 8) | (response[offset + 1] as usize);
             offset = pointer;
+            hops += 1;
         } else {
             if label_len == 0 {
                 break;
@@ -348,9 +718,10 @@ fn parse_name(response: &[u8], mut offset: usize, name: &mut String) -> io::Resu
                 name.push('.');
             }
             if offset + 1 + label_len > response.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Label length exceeds data length"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "label length exceeds response length"));
             }
-            name.push_str(std::str::from_utf8(&response[offset + 1..offset + 1 + label_len]).unwrap());
+            name.push_str(std::str::from_utf8(&response[offset + 1..offset + 1 + label_len])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in DNS name"))?);
             offset += label_len + 1;
         }
     }
@@ -360,6 +731,9 @@ fn parse_name(response: &[u8], mut offset: usize, name: &mut String) -> io::Resu
 
 fn calculate_statistics(response_times: &[f64]) -> (f64, f64, f64, f64) {
     let valid_times: Vec<&f64> = response_times.iter().filter(|&&x| x != -1.0).collect();
+    if valid_times.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     let avg = valid_times.iter().copied().sum::<f64>() / valid_times.len() as f64;
     let min = valid_times.iter().copied().fold(f64::INFINITY, |a, b| a.min(*b));
     let max = valid_times.iter().copied().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
@@ -368,13 +742,6 @@ fn calculate_statistics(response_times: &[f64]) -> (f64, f64, f64, f64) {
     (min, avg, max, std_dev)
 }
 
-fn generate_compare_output(dns_server: &str, count: u32, failed: u32, stats: &(f64, f64, f64, f64)) -> io::Result<String> {
-    let (min, avg, max, std_dev) = stats;
-    let loss_percentage = (failed as f64 / count as f64) * 100.0;
-
-    Ok(format!("{:<25} {:<10.3} {:<10.3} {:<10.3} {:<12.3} {:<10.1}", 
-        dns_server, min, avg, max, std_dev, loss_percentage))
-}
 
 fn print_statistics(domain: &str, count: u32, failed: u32, stats: &(f64, f64, f64, f64)) {
     let (min, avg, max, std_dev) = stats;
@@ -385,13 +752,17 @@ fn print_statistics(domain: &str, count: u32, failed: u32, stats: &(f64, f64, f6
 }
 
 fn plot_response_times(response_times: &[f64]) {
-    let max_time = response_times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_time = response_times.iter().cloned().filter(|&t| t >= 0.0).fold(f64::NEG_INFINITY, f64::max);
     let plot_height = 10;
-    let scale = plot_height as f64 / max_time;
 
     for (i, &time) in response_times.iter().enumerate() {
-        let bar_height = (time * scale).round() as usize;
-        let bar: String = std::iter::repeat('#').take(bar_height).collect();
-        println!("{:3}: {} {:.3} ms", i + 1, bar, time);
+        if time < 0.0 {
+            println!("{:3}: timeout", i + 1);
+        } else {
+            let scale = plot_height as f64 / max_time;
+            let bar_height = (time * scale).round() as usize;
+            let bar: String = std::iter::repeat('#').take(bar_height).collect();
+            println!("{:3}: {} {:.3} ms", i + 1, bar, time);
+        }
     }
 }
